@@ -182,6 +182,35 @@ class ITGlueClient {
     const result = await this.request<T>(path, params);
     return result.data[0];
   }
+
+  async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "x-api-key": this.apiKey,
+        "Content-Type": "application/vnd.api+json",
+        Accept: "application/vnd.api+json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`IT Glue API error (${response.status}): ${errorBody}`);
+    }
+
+    const json = (await response.json()) as JsonApiResponse;
+
+    if (json.errors && json.errors.length > 0) {
+      const errorMessages = json.errors.map((e) => e.detail || e.title).join(", ");
+      throw new Error(`IT Glue API error: ${errorMessages}`);
+    }
+
+    const resource = Array.isArray(json.data) ? json.data[0] : json.data;
+    return deserializeResource(resource) as T;
+  }
 }
 
 // Credential extraction from gateway headers
@@ -440,6 +469,46 @@ function createMcpServer(): Server {
           required: ["organization_id"],
         },
       },
+      {
+        name: "get_document",
+        description: "Get a specific document by ID from IT Glue",
+        inputSchema: {
+          type: "object",
+          properties: {
+            organization_id: {
+              type: "number",
+              description: "Organization ID that owns the document",
+            },
+            id: {
+              type: "string",
+              description: "The document ID",
+            },
+          },
+          required: ["organization_id", "id"],
+        },
+      },
+      {
+        name: "create_document",
+        description: "Create a new document in IT Glue for an organization",
+        inputSchema: {
+          type: "object",
+          properties: {
+            organization_id: {
+              type: "number",
+              description: "Organization ID to create the document in",
+            },
+            name: {
+              type: "string",
+              description: "Document name/title",
+            },
+            content: {
+              type: "string",
+              description: "Document content (HTML supported)",
+            },
+          },
+          required: ["organization_id", "name"],
+        },
+      },
       // Flexible Assets
       {
         name: "search_flexible_assets",
@@ -689,6 +758,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(result, null, 2),
             },
           ],
+        };
+      }
+
+      case "get_document": {
+        if (!args?.organization_id || !args?.id) {
+          return {
+            content: [{ type: "text", text: "Error: organization_id and id are required" }],
+            isError: true,
+          };
+        }
+        const doc = await client.get(
+          `/organizations/${args.organization_id}/relationships/documents/${args.id}`
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(doc, null, 2) }],
+        };
+      }
+
+      case "create_document": {
+        if (!args?.organization_id || !args?.name) {
+          return {
+            content: [{ type: "text", text: "Error: organization_id and name are required" }],
+            isError: true,
+          };
+        }
+        const newDoc = await client.post(
+          `/organizations/${args.organization_id}/relationships/documents`,
+          {
+            data: {
+              type: "documents",
+              attributes: {
+                name: args.name,
+                ...(args.content ? { content: args.content } : {}),
+              },
+            },
+          }
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(newDoc, null, 2) }],
         };
       }
 

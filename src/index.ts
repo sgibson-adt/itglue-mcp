@@ -511,6 +511,20 @@ function createMcpServer(): Server {
       },
       // Flexible Assets
       {
+        name: "list_flexible_asset_types",
+        description: "List all flexible asset types defined in IT Glue. Call this first to discover type IDs before using search_flexible_assets.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            organization_id: {
+              type: "number",
+              description: "Filter by organization ID (optional — returns global types if omitted)",
+            },
+          },
+          required: [],
+        },
+      },
+      {
         name: "search_flexible_assets",
         description: "Search for flexible assets in IT Glue (requires flexible_asset_type_id filter)",
         inputSchema: {
@@ -815,6 +829,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Flexible Assets
+      case "list_flexible_asset_types": {
+        const params: Record<string, unknown> = {};
+        if (args?.organization_id) {
+          params.filter = { organizationId: args.organization_id };
+        }
+        params.page = { size: 100, number: 1 };
+
+        const result = await client.request("/flexible_asset_types", params);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
       case "search_flexible_assets": {
         if (!args?.flexible_asset_type_id) {
           return {

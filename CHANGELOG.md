@@ -1,3 +1,10 @@
+## [1.5.2](https://github.com/wyre-technology/itglue-mcp/compare/v1.5.1...v1.5.2) (2026-03-31)
+
+
+### Bug Fixes
+
+* **deploy:** replace node_compat with nodejs_compat for Wrangler v4 ([b9d580d](https://github.com/wyre-technology/itglue-mcp/commit/b9d580d2e2d9b0848256c0c0146e988bbb92fe95))
+
 ## [1.5.1](https://github.com/wyre-technology/itglue-mcp/compare/v1.5.0...v1.5.1) (2026-03-25)
 
 

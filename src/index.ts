@@ -291,7 +291,7 @@ function createClient(credentials: GatewayCredentials): ITGlueClient {
  * Create a fresh MCP Server with all tool handlers registered.
  * Called per-request in HTTP (stateless) mode so each initialize gets a clean server.
  */
-function createMcpServer(): Server {
+function createMcpServer(credentialOverrides?: GatewayCredentials): Server {
   const server = new Server(
     {
       name: "itglue-mcp",
@@ -720,7 +720,7 @@ function createMcpServer(): Server {
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  const credentials = getCredentialsFromEnv();
+  const credentials = credentialOverrides ?? getCredentialsFromEnv();
 
   if (!credentials.apiKey) {
     return {
@@ -1307,7 +1307,8 @@ async function startHttpTransport(): Promise<void> {
         return;
       }
 
-      // In gateway mode, extract credentials from headers
+      // In gateway mode, extract credentials from headers; otherwise undefined (env fallback)
+      let gatewayCredentials: GatewayCredentials | undefined;
       if (isGatewayMode) {
         const headers = req.headers as Record<string, string | string[] | undefined>;
         const apiKey =
@@ -1326,21 +1327,18 @@ async function startHttpTransport(): Promise<void> {
           return;
         }
 
-        process.env.ITGLUE_API_KEY = apiKey;
-
         const baseUrl = headers["x-itglue-base-url"] as string | undefined;
-        if (baseUrl) {
-          process.env.ITGLUE_BASE_URL = baseUrl;
-        }
-
         const region = headers["x-itglue-region"] as string | undefined;
-        if (region) {
-          process.env.ITGLUE_REGION = region;
-        }
+
+        gatewayCredentials = {
+          apiKey,
+          region: (region || "us") as ITGlueRegion,
+          baseUrl: baseUrl || undefined,
+        };
       }
 
       // Stateless: create fresh server + transport for each request
-      const server = createMcpServer();
+      const server = createMcpServer(gatewayCredentials);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,

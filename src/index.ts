@@ -286,14 +286,25 @@ export async function createDocumentWithContent(
     organization_id: number | string;
     name: string;
     content?: string;
+    document_folder_id?: number | string;
   }
 ): Promise<Record<string, unknown>> {
+  const attributes: Record<string, unknown> = { name: args.name };
+  if (args.document_folder_id !== undefined && args.document_folder_id !== null) {
+    // Verified live 2026-05-12: IT Glue accepts both snake_case
+    // `document_folder_id` and kebab-case `document-folder-id` on write
+    // (both reach the same validation path; 99999999 → 422 "must exist in
+    // the same organization"). We use snake_case to match the precedent set
+    // by `resource_type` on document-sections.
+    attributes.document_folder_id = args.document_folder_id;
+  }
+
   const newDoc = await client.post<Record<string, unknown>>(
     `/organizations/${args.organization_id}/relationships/documents`,
     {
       data: {
         type: "documents",
-        attributes: { name: args.name },
+        attributes,
       },
     }
   );
@@ -312,6 +323,46 @@ export async function createDocumentWithContent(
   }
 
   return newDoc;
+}
+
+/**
+ * Parse a folder reference supplied by the user. Folder *names* are not
+ * reachable with API-key auth (IT Glue gates `/document_folders` behind a
+ * user-session JWT — see the README for the JWT escape hatch). So the
+ * elicitation path accepts inputs the user can copy out of their browser
+ * tab while looking at the folder they want:
+ *
+ *   - empty / whitespace → root
+ *   - bare numeric id    → folder
+ *   - URL containing `/documents/folder/<id>/` → folder
+ *   - URL containing `/docs/<id>` or `/DOC-<org>-<id>` → doc (caller GETs
+ *     the doc and reads its `document-folder-id` to resolve the folder)
+ *   - anything else      → invalid
+ */
+export type FolderReference =
+  | { kind: "root" }
+  | { kind: "folder"; folderId: number }
+  | { kind: "doc"; docId: number }
+  | { kind: "invalid"; input: string };
+
+export function parseFolderReference(input: string | null | undefined): FolderReference {
+  if (input == null) return { kind: "root" };
+  const trimmed = input.trim();
+  if (trimmed === "") return { kind: "root" };
+
+  if (/^\d+$/.test(trimmed)) {
+    return { kind: "folder", folderId: Number(trimmed) };
+  }
+
+  const folderMatch = trimmed.match(/\/documents\/folder\/(\d+)/);
+  if (folderMatch) return { kind: "folder", folderId: Number(folderMatch[1]) };
+
+  const docMatch =
+    trimmed.match(/\/docs\/(\d+)/) ??
+    trimmed.match(/\/DOC-\d+-(\d+)/i);
+  if (docMatch) return { kind: "doc", docId: Number(docMatch[1]) };
+
+  return { kind: "invalid", input: trimmed };
 }
 
 // Credential extraction from gateway headers
@@ -599,7 +650,7 @@ function createMcpServer(credentialOverrides?: GatewayCredentials): Server {
       },
       {
         name: "create_document",
-        description: "Create a new document in IT Glue for an organization",
+        description: "Create a new document in IT Glue for an organization. If neither document_folder_id nor skip_folder_prompt is supplied, the user is asked to paste a folder URL, a sibling-document URL, or a numeric folder ID (since IT Glue's API does not expose folder names to API-key callers). Pass skip_folder_prompt=true to always create at the organization root without prompting.",
         inputSchema: {
           type: "object",
           properties: {
@@ -614,6 +665,14 @@ function createMcpServer(credentialOverrides?: GatewayCredentials): Server {
             content: {
               type: "string",
               description: "Document content (HTML supported)",
+            },
+            document_folder_id: {
+              type: "number",
+              description: "Optional folder ID to place the document in. Find folder IDs in the IT Glue web URL (e.g. `/documents/folder/12345/`) or by inspecting `document-folder-id` on an existing document in that folder.",
+            },
+            skip_folder_prompt: {
+              type: "boolean",
+              description: "If true, skip the interactive folder picker and create the document at the organization root.",
             },
           },
           required: ["organization_id", "name"],
@@ -1149,10 +1208,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             isError: true,
           };
         }
+
+        let folderId = args.document_folder_id as number | string | undefined;
+        const skipPrompt = args.skip_folder_prompt === true;
+
+        if (folderId === undefined && !skipPrompt) {
+          const elicited = await elicitText(
+            `Where should "${args.name}" go? Paste one of:\n  • a folder URL (e.g. https://…/documents/folder/12345/)\n  • a sibling document's URL (e.g. https://…/docs/67890)\n  • a folder ID number\nLeave blank to create at the organization root.`,
+            "folder",
+            "IT Glue folder URL, sibling-document URL, or numeric folder ID"
+          );
+          const ref = parseFolderReference(elicited);
+          if (ref.kind === "invalid") {
+            return {
+              content: [{
+                type: "text",
+                text: `Could not parse folder reference "${ref.input}". Expected a folder URL, a document URL, a numeric folder ID, or an empty value for root.`,
+              }],
+              isError: true,
+            };
+          }
+          let siblingAtRoot = false;
+          if (ref.kind === "folder") {
+            folderId = ref.folderId;
+          } else if (ref.kind === "doc") {
+            const sibling = await client.get<Record<string, unknown>>(
+              `/organizations/${args.organization_id}/relationships/documents/${ref.docId}`
+            );
+            const siblingFolder = sibling.documentFolderId ?? sibling["document-folder-id"];
+            if (siblingFolder != null) {
+              folderId = siblingFolder as number | string;
+            } else {
+              // The user pasted a sibling URL expecting placement; surface that
+              // the sibling itself is at root so "created at root" isn't a
+              // surprise.
+              siblingAtRoot = true;
+            }
+          }
+          // ref.kind === "root" (elicit blank/null/unsupported): fall through with folderId undefined.
+
+          if (siblingAtRoot) {
+            const newDoc = await createDocumentWithContent(client, {
+              organization_id: args.organization_id as number | string,
+              name: args.name as string,
+              content: args.content as string | undefined,
+              document_folder_id: folderId,
+            });
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Note: the sibling document you referenced lives at the organization root, so the new document was also created at the root.\n\n${JSON.stringify(newDoc, null, 2)}`,
+                },
+              ],
+            };
+          }
+        }
+
         const newDoc = await createDocumentWithContent(client, {
           organization_id: args.organization_id as number | string,
           name: args.name as string,
           content: args.content as string | undefined,
+          document_folder_id: folderId,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(newDoc, null, 2) }],

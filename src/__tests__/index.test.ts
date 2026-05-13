@@ -19,7 +19,11 @@ vi.stubGlobal("fetch", mockFetch);
 // Importing from ../index pulls in the production helpers. The module guards
 // its main() bootstrap on NODE_ENV=test so this import does not start an MCP
 // server during tests.
-import { createDocumentWithContent, ITGlueClient } from "../index.js";
+import {
+  createDocumentWithContent,
+  ITGlueClient,
+  parseFolderReference,
+} from "../index.js";
 
 // Store original env vars
 const originalEnv = { ...process.env };
@@ -771,6 +775,52 @@ describe("Tool Handler Integration", () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
+    it("includes document_folder_id on the POST attributes when provided", async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse({
+        data: { id: "789", type: "documents", attributes: { name: "Doc" } },
+      }));
+
+      await createDocumentWithContent(newClient(), {
+        organization_id: 1765329,
+        name: "Doc",
+        document_folder_id: 42,
+      });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data.attributes.document_folder_id).toBe(42);
+      expect(body.data.attributes.name).toBe("Doc");
+    });
+
+    it("accepts string folder ids and passes them through unchanged", async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse({
+        data: { id: "789", type: "documents", attributes: { name: "Doc" } },
+      }));
+
+      await createDocumentWithContent(newClient(), {
+        organization_id: 1765329,
+        name: "Doc",
+        document_folder_id: "42",
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data.attributes.document_folder_id).toBe("42");
+    });
+
+    it("omits document_folder_id from attributes when not provided", async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse({
+        data: { id: "789", type: "documents", attributes: { name: "Doc" } },
+      }));
+
+      await createDocumentWithContent(newClient(), {
+        organization_id: 1765329,
+        name: "Doc",
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data.attributes).not.toHaveProperty("document_folder_id");
+    });
+
     it("returns the document (not the section) as the caller-visible result", async () => {
       mockFetch
         .mockResolvedValueOnce(createMockResponse({
@@ -788,6 +838,57 @@ describe("Tool Handler Integration", () => {
 
       expect((result as { id: string; type: string }).id).toBe("23350960");
       expect((result as { id: string; type: string }).type).toBe("documents");
+    });
+  });
+
+  describe("parseFolderReference", () => {
+    it("returns root for null, undefined, empty, and whitespace input", () => {
+      expect(parseFolderReference(null)).toEqual({ kind: "root" });
+      expect(parseFolderReference(undefined)).toEqual({ kind: "root" });
+      expect(parseFolderReference("")).toEqual({ kind: "root" });
+      expect(parseFolderReference("   \n  ")).toEqual({ kind: "root" });
+    });
+
+    it("returns a folder reference for a bare numeric id (trimmed)", () => {
+      expect(parseFolderReference("6926612")).toEqual({ kind: "folder", folderId: 6926612 });
+      expect(parseFolderReference("  6926612  ")).toEqual({ kind: "folder", folderId: 6926612 });
+    });
+
+    it("extracts the folder id from an IT Glue folder URL", () => {
+      const url = "https://wyretechnology.itglue.com/8250506/documents/folder/6926612/";
+      expect(parseFolderReference(url)).toEqual({ kind: "folder", folderId: 6926612 });
+    });
+
+    it("handles a folder URL with no trailing slash", () => {
+      const url = "https://wyretechnology.itglue.com/8250506/documents/folder/6926612";
+      expect(parseFolderReference(url)).toEqual({ kind: "folder", folderId: 6926612 });
+    });
+
+    it("extracts the doc id from a `/docs/<id>` URL (resource-url shape)", () => {
+      const url = "https://wyretechnology.itglue.com/8250506/docs/22884804";
+      expect(parseFolderReference(url)).toEqual({ kind: "doc", docId: 22884804 });
+    });
+
+    it("extracts the doc id from a `DOC-<org>-<id>` URL (UI shape)", () => {
+      const url = "https://wyretechnology.itglue.com/DOC-8250506-22884804";
+      expect(parseFolderReference(url)).toEqual({ kind: "doc", docId: 22884804 });
+    });
+
+    it("prefers the more specific folder pattern when both could match", () => {
+      // A folder URL is unambiguous — the doc pattern should not steal from it.
+      const url = "https://x/8250506/documents/folder/6926612/";
+      expect(parseFolderReference(url)).toEqual({ kind: "folder", folderId: 6926612 });
+    });
+
+    it("flags unparseable input as invalid (preserves the original for the error message)", () => {
+      expect(parseFolderReference("not a url or id")).toEqual({
+        kind: "invalid",
+        input: "not a url or id",
+      });
+      expect(parseFolderReference("https://example.com/somewhere/else")).toEqual({
+        kind: "invalid",
+        input: "https://example.com/somewhere/else",
+      });
     });
   });
 

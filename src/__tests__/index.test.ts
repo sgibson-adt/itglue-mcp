@@ -2170,9 +2170,13 @@ describe("Core tools (round-trip)", () => {
 
     it("passes the name filter through as filter[name]", async () => {
       const client = await connectCoreClient();
-      mockFetch.mockResolvedValueOnce(
-        createMockResponse(createJsonApiResponse([]))
-      );
+      // The exact-match query comes back empty here, which triggers the
+      // name-fallback search (see the "name fallback" tests below) — queue a
+      // second empty page for it so that fallback doesn't hit an unconfigured
+      // mock.
+      mockFetch
+        .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+        .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])));
 
       await client.callTool({
         name: "search_organizations",
@@ -2209,9 +2213,9 @@ describe("Core tools (round-trip)", () => {
 
     it("sends the API key and JSON:API headers on the handler's own request", async () => {
       const client = await connectCoreClient();
-      mockFetch.mockResolvedValueOnce(
-        createMockResponse(createJsonApiResponse([]))
-      );
+      mockFetch
+        .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+        .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])));
 
       await client.callTool({
         name: "search_organizations",
@@ -2223,6 +2227,137 @@ describe("Core tools (round-trip)", () => {
       expect(headers["x-api-key"]).toBe("test-api-key");
       expect(headers["Content-Type"]).toBe("application/vnd.api+json");
       expect(headers["Accept"]).toBe("application/vnd.api+json");
+    });
+
+    describe("name fallback (IT Glue's filter[name] is exact-match only)", () => {
+      it("falls back to a client-side substring match when the exact-match query is empty", async () => {
+        const client = await connectCoreClient();
+        mockFetch
+          // Primary exact-match query: no hit.
+          .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+          // Fallback broad listing: matched client-side.
+          .mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse([
+                { id: "1", type: "organizations", attributes: { name: "Acme Corp Pty Ltd" } },
+                { id: "2", type: "organizations", attributes: { name: "Beta Inc" } },
+              ])
+            )
+          );
+
+        const result = await client.callTool({
+          name: "search_organizations",
+          arguments: { name: "acme" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+        // Fallback request drops the (broken) exact-match name filter.
+        expect(decodedUrl(1)).not.toContain("filter[name]");
+        expect(decodedUrl(1)).toContain("page[size]=1000");
+
+        const text = firstText(result);
+        expect(text).toContain("client-side, case-insensitive");
+        expect(text).toContain("Acme Corp Pty Ltd");
+        expect(text).not.toContain("Beta Inc");
+      });
+
+      it("does not fall back when the exact-match query already found something", async () => {
+        const client = await connectCoreClient();
+        mockFetch.mockResolvedValueOnce(
+          createMockResponse(
+            createJsonApiResponse([
+              { id: "1", type: "organizations", attributes: { name: "Acme Corp" } },
+            ])
+          )
+        );
+
+        const result = await client.callTool({
+          name: "search_organizations",
+          arguments: { name: "Acme Corp" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(firstText(result)).not.toContain("client-side");
+      });
+
+      it("preserves other filters and pagination on the fallback request", async () => {
+        const client = await connectCoreClient();
+        mockFetch
+          .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+          .mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse([
+                { id: "1", type: "organizations", attributes: { name: "Acme Corp" } },
+              ])
+            )
+          );
+
+        await client.callTool({
+          name: "search_organizations",
+          arguments: { name: "acme", organization_type_id: 7, sort: "-name" },
+        });
+
+        const fallbackUrl = decodedUrl(1);
+        expect(fallbackUrl).toContain("filter[organization-type-id]=7");
+        expect(fallbackUrl).toContain("sort=-name");
+        expect(fallbackUrl).not.toContain("filter[name]");
+      });
+
+      it("slices the client-side matches by the caller's requested page", async () => {
+        const client = await connectCoreClient();
+        mockFetch
+          .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+          .mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse(
+                Array.from({ length: 3 }, (_, i) => ({
+                  id: String(i + 1),
+                  type: "organizations",
+                  attributes: { name: `Acme Corp ${i + 1}` },
+                }))
+              )
+            )
+          );
+
+        const result = await client.callTool({
+          name: "search_organizations",
+          arguments: { name: "acme", page_size: 2, page_number: 2 },
+        });
+
+        const text = firstText(result);
+        expect(text).toContain("Acme Corp 3");
+        expect(text).not.toContain("Acme Corp 1");
+        expect(text).not.toContain("Acme Corp 2");
+        expect(text).toContain('"totalCount": 3');
+        expect(text).toContain('"currentPage": 2');
+      });
+
+      it("flags a capped fallback listing when more pages exist beyond the cap", async () => {
+        const client = await connectCoreClient();
+        mockFetch.mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])));
+        // 5 pages (NAME_FALLBACK_MAX_PAGES), each reporting a next page.
+        for (let i = 0; i < 5; i++) {
+          mockFetch.mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse([], {
+                "current-page": i + 1,
+                "next-page": i + 2,
+                "prev-page": i > 0 ? i : null,
+                "total-pages": 10,
+                "total-count": 0,
+              })
+            )
+          );
+        }
+
+        const result = await client.callTool({
+          name: "search_organizations",
+          arguments: { name: "nonexistent" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(6);
+        expect(firstText(result)).toContain("capped");
+      });
     });
   });
 
@@ -3226,6 +3361,111 @@ describe("Document folder access (API-key-first, round-trip)", () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
       expect(isError(result)).toBe(true);
       expect(firstText(result)).toContain("Documents module");
+    });
+
+    describe("name fallback (IT Glue's filter[name] is exact-match only)", () => {
+      it("falls back to a client-side substring match when the exact-match query is empty", async () => {
+        const client = await connectClient({ apiKey: "test-api-key" });
+        mockFetch
+          // Primary exact-match query (folder-inclusive null-filter attempt): no hit.
+          .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+          // Fallback broad listing (its own null-filter attempt): matched client-side.
+          .mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse([
+                { id: "1", type: "documents", attributes: { name: "Change Management SOP" } },
+                { id: "2", type: "documents", attributes: { name: "Onboarding Checklist" } },
+              ])
+            )
+          );
+
+        const result = await client.callTool({
+          name: "search_documents",
+          arguments: { organization_id: 123, name: "change" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+        expect(decodedUrl(0)).toContain("filter[name]=change");
+        expect(decodedUrl(1)).not.toContain("filter[name]");
+
+        const text = firstText(result);
+        expect(text).toContain("client-side, case-insensitive");
+        expect(text).toContain("Change Management SOP");
+        expect(text).not.toContain("Onboarding Checklist");
+      });
+
+      it("does not fall back when the exact-match query already found something", async () => {
+        const client = await connectClient({ apiKey: "test-api-key" });
+        mockFetch.mockResolvedValueOnce(
+          createMockResponse(
+            createJsonApiResponse([
+              { id: "1", type: "documents", attributes: { name: "Change Management SOP" } },
+            ])
+          )
+        );
+
+        const result = await client.callTool({
+          name: "search_documents",
+          arguments: { organization_id: 123, name: "Change Management SOP" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(firstText(result)).not.toContain("client-side");
+      });
+
+      it("keeps the explicit document_folder_id scope on the fallback request", async () => {
+        const client = await connectClient({ apiKey: "test-api-key" });
+        mockFetch
+          .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+          .mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse([
+                { id: "1", type: "documents", attributes: { name: "Change Management SOP" } },
+              ])
+            )
+          );
+
+        await client.callTool({
+          name: "search_documents",
+          arguments: { organization_id: 123, document_folder_id: 42, name: "change" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+        expect(decodedUrl(0)).toContain("filter[document-folder-id]=42");
+        expect(decodedUrl(1)).toContain("filter[document-folder-id]=42");
+        expect(decodedUrl(1)).not.toContain("filter[name]");
+      });
+
+      it("shows the ROOT-LEVEL scope note when the fallback itself degrades to unfiltered, even though the primary attempt was folder-inclusive", async () => {
+        const client = await connectClient({ apiKey: "test-api-key" });
+        mockFetch
+          // Primary query: folder-inclusive null-filter attempt succeeds, but empty.
+          .mockResolvedValueOnce(createMockResponse(createJsonApiResponse([])))
+          // Fallback page 1 re-negotiates independently and degrades all the
+          // way down to the legacy root-only listing.
+          .mockResolvedValueOnce(createErrorResponse(400, "bad filter"))
+          .mockResolvedValueOnce(createErrorResponse(422, "unprocessable"))
+          .mockResolvedValueOnce(
+            createMockResponse(
+              createJsonApiResponse([
+                { id: "1", type: "documents", attributes: { name: "Change Log" } },
+              ])
+            )
+          );
+
+        const result = await client.callTool({
+          name: "search_documents",
+          arguments: { organization_id: 123, name: "change" },
+        });
+
+        expect(mockFetch).toHaveBeenCalledTimes(4);
+        const text = firstText(result);
+        // The response reflects the fallback's actual (root-only) scope, not
+        // the primary attempt's folder-inclusive one.
+        expect(text).toContain("ROOT-LEVEL");
+        expect(text).not.toContain("includes documents inside folders");
+        expect(text).toContain("Change Log");
+      });
     });
   });
 

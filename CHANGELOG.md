@@ -125,6 +125,26 @@
 
 ### Fixed
 
+- **`search_organizations` and `search_documents` silently required an exact
+  organization/document name.** IT Glue's `filter[name]` matches these two
+  resources EXACTLY, not partially — unlike `search_configurations`,
+  `search_locations` and `search_passwords`, whose `filter[name]` genuinely
+  does a case-insensitive contains match. A caller searching for "Acme" got
+  nothing back unless it supplied the organization's or document's full
+  stored name, even though both tools' own descriptions promised a "partial
+  match". Both handlers still send the cheap exact-match query first — the
+  fast, correct answer whenever the caller already has the exact name — and
+  only fall back when that comes back empty, walking a broader listing without
+  the exact-name filter and matching `name` client-side as a case-insensitive
+  substring (`searchByNameWithFallback()`), capped at 5 pages of 1,000 records
+  so a name that matches nothing doesn't walk an entire multi-thousand-record
+  account. The result carries a note whenever this fallback path was used
+  (and whether it was capped). For `search_documents`, the existing
+  folder-scope note (root-level vs folder-inclusive) is now derived from
+  whichever attempt actually produced the fallback's data rather than the
+  primary (empty) request's attempt, so it can no longer describe a folder
+  scope the returned documents don't actually have.
+
 - **`search_passwords` could hand back plaintext secrets.** The handler asks IT
   Glue not to send them (`show_password=false`), but that is a request, not a
   guarantee: it sits one refactor away from being dropped, and a tenant or API
